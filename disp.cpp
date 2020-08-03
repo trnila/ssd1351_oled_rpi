@@ -14,11 +14,10 @@
 #include <linux/spi/spidev.h>
 #include <gpiod.h>
 #include <limits.h>
-#include "a.h"
+#include <sys/mman.h>
 
 struct display {
 	int spi_cdev;
-	struct gpiod_line *res;
 	struct gpiod_line *dc;
 };
 
@@ -100,6 +99,29 @@ void ssd1351_init(struct display *disp) {
         display_cmd(disp, (const uint8_t[]){0x5C}, 1);                     // Write RAM
 }
 
+struct video {
+	uint8_t *mem;
+	size_t frames;
+};
+
+struct video load_video(const char *path) {
+	int fd = open(path, O_RDONLY);
+	if(fd < 0) {
+		perror("open");
+		exit(1);
+	}
+	off_t size = lseek(fd, 0, SEEK_END);
+	uint8_t *videom = (uint8_t*) mmap(0, size, PROT_READ, MAP_SHARED, fd, 0);
+	if(videom == MAP_FAILED) {
+		perror("mmap");
+		exit(1);
+	}
+	struct video video;
+	video.mem = videom;
+	video.frames = size / (128*128*2);
+	return video;
+}
+
 int main() {
 	struct gpiod_chip *chip = gpiod_chip_open_by_name("gpiochip0");
 	if(!chip) {
@@ -129,11 +151,7 @@ int main() {
 		exit(1);
 	}
 
-	struct display first;
-	first.spi_cdev = open_spi(0, 0);
-	first.res = res;
-	first.dc = dc;
-
+	// reset all displays
 	if(gpiod_line_set_value(res, 0) < 0) {
 		perror("line set value");
 		exit(1);
@@ -145,37 +163,42 @@ int main() {
 	}
 	usleep(2);
 
-	ssd1351_init(&first);
 
-//	memset(fb, 0x00, 128*128 * 2);
-	int off = 0;
+	struct display displays[2];
+	displays[0].spi_cdev = open_spi(0, 0);
+	displays[0].dc = dc;
+	ssd1351_init(&displays[0]);
+
+	displays[1].spi_cdev = open_spi(0, 1);
+	displays[1].dc = dc;
+	ssd1351_init(&displays[1]);
+
+
+	struct video vid1 = load_video("out");
+	struct video vid2 = load_video("vsb.raw");
+
+	size_t frame = 0;
+	int fps = 30;
 	for(;;) {
-		uint16_t fb[128*128]{};
-		int i = 0;
-		srand(time(NULL));
-		int j = 0;
-		for(int r = off; r < off+20; r++) {
-			for(int c = off; c < off+20; c++) {
-				fb[r * 128 + c] = to_color(0, 255, 0);
-				//fb[i] = to_color(MagickImage[j], MagickImage[j+1], MagickImage[j+2]);
-				i++;
-				j += 3;
-			}
+		struct timespec start, end;
+		clock_gettime(CLOCK_MONOTONIC, &start);
+		display_data(&displays[0], vid1.mem + 128*128*2*(frame % vid1.frames) , 128*128*2);	
+		display_data(&displays[1], vid2.mem + 128*128*2*(frame % vid2.frames) , 128*128*2);	
+		frame++;
+
+		clock_gettime(CLOCK_MONOTONIC, &end);
+		uint64_t elapsed_us = 0;
+		
+		if((end.tv_nsec - start.tv_nsec) < 0) {
+			elapsed_us = (end.tv_sec - start.tv_sec - 1UL) * 1000000UL + (1000000000UL + end.tv_nsec - start.tv_nsec) / 1000UL;
+		} else {
+			elapsed_us = (end.tv_sec - start.tv_sec) * 1000000UL + (end.tv_nsec - start.tv_nsec) / 1000UL;
 		}
-		int sent = 0;
-		int len = sizeof(fb);
-		while(sent < len) {
-			int rem = len - sent;
-			if(rem > 4096) {
-//				rem = 4096;
-			}
-			display_data(&first, ((const uint8_t*) fb) + sent , rem);	
-			sent += rem;
-		} 
-		off++;
-		if(off > 50) {
-			off = 0;
+
+		int t_us = 1000000 / fps - elapsed_us;
+		printf("%llu %d\n", elapsed_us, t_us);
+		if(t_us > 1000) {
+			usleep(t_us);
 		}
-		usleep(10000);
 	}
 }
